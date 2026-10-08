@@ -61,6 +61,7 @@ If a person, place or organization name looks misheard (odd spelling, not a real
 technologies (write Proxmox, not "Broxmox"), without mentioning the fix. Never compare numbers like
 salary to the market; just report them.
 If a passage is garbled, leave it out. Do not speculate about what it meant.
+Passages marked [unclear audio] could not be transcribed: skip them.
 No preamble, no closing remarks, no participant list."""
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -209,31 +210,42 @@ def speaker_count(transcript):
 PROGRESS = re.compile(r"(\d+)% \| Elapsed Time: [\d.]+ s \| Remaining: ([\d.]+) s")
 
 
+UNCLEAR = "_[unclear audio]_"
+
+
 def parse_speaker(line):
-    """`SPEAKER <file> 1 <start> <dur> <text...> <NA> <label> <NA> <NA>` -> (start, label, text)."""
+    """`SPEAKER <file> 1 <start> <dur> <text...> <NA> <label> <NA> <NA>` -> (start, end, label)."""
     t = line.split()
     if len(t) < 10 or t[0] != "SPEAKER":
         return None
-    return float(t[3]), t[-3], " ".join(t[5:-4])
+    return float(t[3]), float(t[3]) + float(t[4]), t[-3]
 
 
-def build_transcript(turns, report_json):
+def reliable(seg):
+    """Whisper's own failure signals: every temperature fallback used up, or looping (repetitive) output."""
+    return seg.get("temperature", 0) < 1.0 and seg.get("compressionRatio", 0) <= 2.4
+
+
+def speaker_at(turns, a, b):
+    """Label of the speaker turn overlapping [a, b] the most (a negative overlap is a gap, so else the nearest)."""
+    return max(turns, key=lambda t: min(b, t[1]) - max(a, t[0]))[2]
+
+
+def build_transcript(turns, segments):
+    """Text from whisper's segments (unreliable ones become [unclear audio]), speakers from the diarization turns."""
     blocks = []
-    if turns:
-        for start, label, text in sorted(turns):
-            if blocks and blocks[-1][1] == label:
-                blocks[-1][2].append(text)
-            else:
-                blocks.append([start, label, [text]])
-        return "\n\n".join(f"**Speaker {lbl}** `{fmt(start)}`\n{' '.join(txt)}" for start, lbl, txt in blocks)
-    for s in json.loads(report_json.read_text())["segments"]:
+    for s in sorted(segments, key=lambda s: s["start"]):
         text = re.sub(r"<\|[^|]*\|>", "", s["text"]).strip()
         if not text:
             continue
-        if not blocks or s["start"] - blocks[-1][0] > 60:
-            blocks.append([s["start"], None, []])
-        blocks[-1][2].append(text)
-    return "\n\n".join(f"`{fmt(start)}`\n{' '.join(txt)}" for start, _, txt in blocks)
+        text = text if reliable(s) else UNCLEAR
+        label = speaker_at(turns, s["start"], s["end"]) if turns else None
+        if not (blocks and blocks[-1][1] == label and (turns or s["start"] - blocks[-1][0] <= 60)):
+            blocks.append([s["start"], label, []])
+        if not (text == UNCLEAR and blocks[-1][2][-1:] == [UNCLEAR]):
+            blocks[-1][2].append(text)
+    return "\n\n".join((f"**Speaker {lbl}** `{fmt(start)}`" if lbl else f"`{fmt(start)}`") + "\n" + " ".join(txt)
+                       for start, lbl, txt in blocks)
 
 
 class Job:
@@ -289,7 +301,7 @@ class Job:
                 tmp = Path(d)
                 wav = self._convert(tmp)
                 turns = self._transcribe(wav, tmp)
-                body = build_transcript(turns, tmp / "meeting.json")
+                body = build_transcript(turns, json.loads((tmp / "meeting.json").read_text())["segments"])
                 shutil.copyfile(tmp / "meeting.srt", self.outdir / f"{self.prefix}transcript.srt")
             (self.outdir / f"{self.prefix}transcript.md").write_text(
                 f"# Transcript: {self.target.stem}\n\n_{date.today()} · {fmt(self.audio)} · whisper {self.opts['whisper']} (local)_\n\n{body}\n")
@@ -383,7 +395,7 @@ class Job:
             if self.steps["Speakers"]["state"] == "wait":
                 self.start("Speakers")
             if turns:
-                self.finish("Speakers", f"{len({t[1] for t in turns})} speakers · {len(turns)} turns")
+                self.finish("Speakers", f"{len({t[2] for t in turns})} speakers · {len(turns)} turns")
             else:
                 errs = [l for l in out if "diarization" in l.lower() and "error" in l.lower()]
                 self.finish("Speakers", "no speaker labels" + (f" ({errs[0][:80]})" if errs else ""))
@@ -905,12 +917,17 @@ def tui():
 # ── entry ────────────────────────────────────────────────────────────────────
 
 def selftest():
-    assert parse_speaker("SPEAKER meeting 1 45.220 11.320 so yeah ok <NA> B <NA> <NA>") == (45.22, "B", "so yeah ok")
+    assert parse_speaker("SPEAKER meeting 1 45.220 11.320 so yeah ok <NA> B <NA> <NA>") == (45.22, 56.54, "B")
     assert parse_speaker("Transcription Performance:") is None
     assert PROGRESS.search("\x1b[K[====] 33% | Elapsed Time: 5.18 s | Remaining: 10.37 s")[1] == "33"
     assert fmt(3725) == "1:02:05" and fmt(65) == "1:05"
-    t = [(30.0, "A", "two"), (0.0, "A", "one"), (40.0, "B", "three")]
-    assert build_transcript(t, None) == "**Speaker A** `0:00`\none two\n\n**Speaker B** `0:40`\nthree"
+    turns = [(0.0, 35.0, "A"), (38.0, 60.0, "B")]
+    seg = lambda a, b, text, **kw: {"start": a, "end": b, "text": text, "temperature": 0.0, "compressionRatio": 1.5, **kw}
+    segs = [seg(30, 34, "two"), seg(0, 5, "<|0.00|>one<|5.00|>"), seg(40, 45, "three"),
+            seg(46, 50, "jackal", temperature=1.0), seg(50, 52, "plan plan", compressionRatio=13.2), seg(53, 55, "ok")]
+    assert build_transcript(turns, segs) == \
+        f"**Speaker A** `0:00`\none two\n\n**Speaker B** `0:40`\nthree {UNCLEAR} ok", build_transcript(turns, segs)
+    assert build_transcript([], segs[:3]) == "`0:00`\none two three"
     md = "# Summary: X\n\n## Overview\nHi **there**.\n\n## Key points\n- **Infra:** good\n  - nested\n\n---\n_Generated locally_"
     assert to_slack(md) == "*Overview*\nHi *there*.\n\n*Key points*\n• *Infra:* good\n  • nested", to_slack(md)
     Console(file=open(os.devnull, "w")).print(render_job(Job(Path("/tmp/x"), [], {"speakers": "auto", "model": "m", "lang": "auto", "context": "", "whisper": "turbo"})))
