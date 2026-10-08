@@ -25,7 +25,7 @@ WHISPER_MODELS = {"large-v3": "openai_whisper-large-v3", "turbo": "openai_whispe
 WHISPER_LABELS = {"large-v3": "large-v3 (most accurate)", "turbo": "large-v3 turbo (faster)"}
 SPEAKERS = HF / "models/argmaxinc/speakerkit-coreml"
 TOKENIZER = HF / "models/openai/whisper-large-v3"
-STATE = Path.home() / ".local/share/debrief/state.json"
+STATE = Path(os.environ.get("DEBRIEF_HOME", "~/.local/share/debrief")).expanduser() / "state.json"
 DEFAULT_LIBRARY = "~/Documents/Meetings"
 OLLAMA = "http://localhost:11434"
 PREFERRED_MODELS = ["qwen3.5:9b", "qwen3-vl:8b-instruct", "qwen3-vl:8b"]
@@ -477,7 +477,7 @@ def tui():
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
-    from textual.widgets import Button, DirectoryTree, Footer, Input, Markdown, OptionList, Static
+    from textual.widgets import DirectoryTree, Footer, Input, Markdown, OptionList, Static
     from textual.widgets.option_list import Option
 
     class Folders(DirectoryTree):
@@ -600,8 +600,6 @@ def tui():
         #meetings > .option-list--option { padding: 0 0 1 0; }
         #right { width: 1fr; padding: 0 2; }
         #info { height: auto; margin: 1 0; }
-        #actions { height: auto; margin-bottom: 1; }
-        #actions Button { margin-right: 1; }
         #doc { height: auto; }
         """
         BINDINGS = [
@@ -642,8 +640,6 @@ def tui():
                     yield OptionList(id="meetings", classes="box")
                 with VerticalScroll(id="right", classes="box"):
                     yield Static(id="info")
-                    with Horizontal(id="actions"):
-                        yield Button("Copy summary  c", id="copy", variant="primary")
                     yield Markdown(id="doc")
             yield Footer()
 
@@ -745,7 +741,6 @@ def tui():
             right = self.query_one("#right")
             right.border_title = path.name
             if self.job and self.job.target == path and self.job.running:
-                self.query_one("#actions").display = False
                 self.shown_summary = None
                 return
             outdir, prefix = outputs(path)
@@ -771,7 +766,6 @@ def tui():
             else:
                 doc = "Not transcribed yet. Press **enter** to start."
             self.query_one("#info", Static).update(info)
-            self.query_one("#actions").display = summary.exists()
             self.query_one("#doc", Markdown).update(re.sub(r"\A# .*\n+(_.*_\n+)?", "", doc))
             right.scroll_home(animate=False)
 
@@ -879,9 +873,6 @@ def tui():
                 self.notify(f"{job.target.name}: done in {fmt(job.t1 - job.t0)}", title="Transcribed", timeout=8)
                 self.bell()
             self.reload()
-
-        def on_button_pressed(self, event):
-            self.action_copy()
 
         def action_copy(self):
             if not self.selected:

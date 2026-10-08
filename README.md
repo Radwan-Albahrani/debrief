@@ -8,7 +8,7 @@ your Mac: no API keys, no uploads, no subscription.
 │ Candidate A - Interview  ● new ││ 48:20 · 49 files · 1.1 GB · 3 speakers           │
 │ today 14:03 · 41:12            ││                                                  │
 │ Candidate B - Interview  ✓     ││  Summary   Transcript   tab switch               │
-│ today 11:20 · 48:20            ││ [ Copy summary  c ]                              │
+│ today 11:20 · 48:20            ││                                                  │
 │ Weekly sync  ✓                 ││ ## Overview                                      │
 │ Oct 2 09:30 · 31:10            ││ ...                                              │
 ╰────────────────────────────────╯╰──────────────────────────────────────────────────╯
