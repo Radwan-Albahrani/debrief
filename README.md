@@ -45,7 +45,9 @@ Downloads resume where they stopped, so if one stalls on a slow connection just 
 ## Use
 
 Put each meeting in its own folder inside `~/Documents/Meetings`. A folder of chunks (for example
-`audio-000.caf`, `audio-001.caf`, …) counts as one meeting; a single audio file works too. Then run:
+`audio-000.caf`, `audio-001.caf`, …) counts as one meeting, and separate simultaneous tracks such as
+`applicationAudio-000.caf` + `microphone-000.caf` are overlaid into one timeline. A single audio file works too.
+Then run:
 
 ```sh
 debrief

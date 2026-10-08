@@ -5,10 +5,12 @@
   debrief setup         download the models (resumable)
   debrief <folder>      one-shot, no UI
 
-A folder is ONE meeting split into chunks, joined in natural sort order.
+A folder is ONE meeting split into chunks, joined in natural sort order. Simultaneous tracks
+(e.g. applicationAudio-000.caf + microphone-000.caf) are overlaid into one timeline.
 Writes transcript.md, transcript.srt and summary.md next to the audio.
 """
 import argparse, json, os, pty, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request, wave
+from array import array
 from collections import deque
 from datetime import date, datetime
 from pathlib import Path
@@ -100,12 +102,40 @@ def audio_files(p):
                    and not f.name.startswith(".")), key=natural)
 
 
-def audio_seconds(files):
-    total = 0.0
+def tracks(files):
+    """Group chunk files by track: `applicationAudio-000.caf` and `microphone-000.caf` are two tracks."""
+    groups = {}
     for f in files:
+        groups.setdefault(re.sub(r"[-_ ]*\d+$", "", f.stem) or f.stem, []).append(f)
+    return groups
+
+
+def overlaid(lengths):
+    """Tracks of about the same length were recorded at the same time; anything else is sequential."""
+    return len(lengths) > 1 and min(lengths) >= 0.9 * max(lengths)
+
+
+def audio_seconds(files):
+    def secs(f):
         m = re.search(r"estimated duration: ([\d.]+)", subprocess.run(["afinfo", str(f)], capture_output=True, text=True).stdout)
-        total += float(m[1]) if m else 0
-    return total
+        return float(m[1]) if m else 0.0
+    per_track = [sum(map(secs, group)) for group in tracks(files).values()]
+    return max(per_track) if overlaid(per_track) else sum(per_track)
+
+
+def mix(a, b, tmp):
+    """Overlay two 16 kHz mono PCM tracks: interleave them as stereo, then let afconvert downmix to mono."""
+    n = max(len(a), len(b)) // 2
+    stereo = array("h", bytes(4 * n))
+    stereo[0::2] = array("h", bytes(a).ljust(2 * n, b"\0"))
+    stereo[1::2] = array("h", bytes(b).ljust(2 * n, b"\0"))
+    src, dst = tmp / "mix-in.wav", tmp / "mix-out.wav"
+    with wave.open(str(src), "wb") as w:
+        w.setnchannels(2), w.setsampwidth(2), w.setframerate(16000)
+        w.writeframes(stereo.tobytes())
+    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(src), str(dst)], check=True, capture_output=True)
+    with wave.open(str(dst)) as w:
+        return w.readframes(w.getnframes())
 
 
 def whisper_path(name):
@@ -321,22 +351,32 @@ class Job:
 
     def _convert(self, tmp):
         self.start("Convert")
-        out = tmp / "meeting.wav"
-        with wave.open(str(out), "wb") as joined:
-            for i, f in enumerate(self.files):
-                self.update("Convert", pct=i / len(self.files), note=f"{f.name}  ({i + 1}/{len(self.files)})")
-                part = tmp / f"{i:05d}.wav"
+        pcm, done, part = {}, 0, tmp / "part.wav"
+        for name, files in tracks(self.files).items():
+            pcm[name] = bytearray()
+            for f in files:
+                self.update("Convert", pct=done / len(self.files), note=f"{f.name}  ({done + 1}/{len(self.files)})")
                 r = subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(f), str(part)],
                                    capture_output=True, text=True)
                 if r.returncode:
                     raise Fail(f"afconvert could not read {f.name}: {r.stderr.strip()}")
                 with wave.open(str(part)) as w:
-                    if i == 0:
-                        joined.setparams(w.getparams())
-                    joined.writeframes(w.readframes(w.getnframes()))
-                part.unlink()
-            self.audio = joined.getnframes() / 16000
-        self.finish("Convert", f"{len(self.files)} file(s) → {fmt(self.audio)} of 16 kHz mono audio")
+                    pcm[name] += w.readframes(w.getnframes())
+                done += 1
+        if overlaid([len(b) for b in pcm.values()]):
+            self.update("Convert", note=f"overlaying {' + '.join(pcm)}…")
+            audio = pcm.popitem()[1]
+            for other in pcm.values():
+                audio = mix(audio, other, tmp)
+            how = f"{len(pcm) + 1} simultaneous tracks overlaid"
+        else:
+            audio, how = b"".join(pcm.values()), f"{len(self.files)} file(s)"
+        out = tmp / "meeting.wav"
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1), w.setsampwidth(2), w.setframerate(16000)
+            w.writeframes(audio)
+        self.audio = len(audio) / 2 / 16000
+        self.finish("Convert", f"{how} → {fmt(self.audio)} of 16 kHz mono audio")
         return out
 
     def _transcribe(self, wav, tmp):
@@ -928,6 +968,9 @@ def selftest():
     assert build_transcript(turns, segs) == \
         f"**Speaker A** `0:00`\none two\n\n**Speaker B** `0:40`\nthree {UNCLEAR} ok", build_transcript(turns, segs)
     assert build_transcript([], segs[:3]) == "`0:00`\none two three"
+    fs = [Path(n) for n in ("applicationAudio-000.caf", "applicationAudio-001.caf", "microphone-000.caf")]
+    assert {k: len(v) for k, v in tracks(fs).items()} == {"applicationAudio": 2, "microphone": 1}
+    assert overlaid([100, 95]) and not overlaid([100, 40]) and not overlaid([100])
     md = "# Summary: X\n\n## Overview\nHi **there**.\n\n## Key points\n- **Infra:** good\n  - nested\n\n---\n_Generated locally_"
     assert to_slack(md) == "*Overview*\nHi *there*.\n\n*Key points*\n• *Infra:* good\n  • nested", to_slack(md)
     Console(file=open(os.devnull, "w")).print(render_job(Job(Path("/tmp/x"), [], {"speakers": "auto", "model": "m", "lang": "auto", "context": "", "whisper": "turbo"})))
