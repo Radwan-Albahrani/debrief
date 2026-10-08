@@ -123,19 +123,13 @@ def audio_seconds(files):
     return max(per_track) if overlaid(per_track) else sum(per_track)
 
 
-def mix(a, b, tmp):
-    """Overlay two 16 kHz mono PCM tracks: interleave them as stereo, then let afconvert downmix to mono."""
+def mix(a, b):
+    """Overlay two 16-bit mono PCM tracks by summing samples (clipped), padding the shorter one with silence.
+    A sum, not an average, keeps each side at full volume while the other is quiet, which is most of a call."""
+    # ponytail: pure-Python loop, ~2 s per 48 min of audio; numpy if that ever matters
     n = max(len(a), len(b)) // 2
-    stereo = array("h", bytes(4 * n))
-    stereo[0::2] = array("h", bytes(a).ljust(2 * n, b"\0"))
-    stereo[1::2] = array("h", bytes(b).ljust(2 * n, b"\0"))
-    src, dst = tmp / "mix-in.wav", tmp / "mix-out.wav"
-    with wave.open(str(src), "wb") as w:
-        w.setnchannels(2), w.setsampwidth(2), w.setframerate(16000)
-        w.writeframes(stereo.tobytes())
-    subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(src), str(dst)], check=True, capture_output=True)
-    with wave.open(str(dst)) as w:
-        return w.readframes(w.getnframes())
+    x, y = array("h", bytes(a).ljust(2 * n, b"\0")), array("h", bytes(b).ljust(2 * n, b"\0"))
+    return array("h", [max(-32768, min(32767, p + q)) for p, q in zip(x, y)]).tobytes()
 
 
 def whisper_path(name):
@@ -367,7 +361,7 @@ class Job:
             self.update("Convert", note=f"overlaying {' + '.join(pcm)}…")
             audio = pcm.popitem()[1]
             for other in pcm.values():
-                audio = mix(audio, other, tmp)
+                audio = mix(audio, other)
             how = f"{len(pcm) + 1} simultaneous tracks overlaid"
         else:
             audio, how = b"".join(pcm.values()), f"{len(self.files)} file(s)"
@@ -971,6 +965,8 @@ def selftest():
     fs = [Path(n) for n in ("applicationAudio-000.caf", "applicationAudio-001.caf", "microphone-000.caf")]
     assert {k: len(v) for k, v in tracks(fs).items()} == {"applicationAudio": 2, "microphone": 1}
     assert overlaid([100, 95]) and not overlaid([100, 40]) and not overlaid([100])
+    pcm = lambda *s: array("h", s).tobytes()
+    assert mix(pcm(1000, -32000), pcm(500, -1000, 7)) == pcm(1500, -32768, 7)
     md = "# Summary: X\n\n## Overview\nHi **there**.\n\n## Key points\n- **Infra:** good\n  - nested\n\n---\n_Generated locally_"
     assert to_slack(md) == "*Overview*\nHi *there*.\n\n*Key points*\n• *Infra:* good\n  • nested", to_slack(md)
     Console(file=open(os.devnull, "w")).print(render_job(Job(Path("/tmp/x"), [], {"speakers": "auto", "model": "m", "lang": "auto", "context": "", "whisper": "turbo"})))
