@@ -1,0 +1,18 @@
+[project]
+name = "debrief"
+version = "0.2.0"
+description = "Local meeting transcripts with speaker labels and Slack-ready summaries. WhisperKit + Ollama, all on your Mac."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["rich==15.0.0", "textual==8.2.8"]
+
+[project.scripts]
+debrief = "debrief.surfaces.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["debrief*"]
