@@ -18,8 +18,11 @@ your Mac: no API keys, no uploads, no subscription.
 - **Whisper large-v3** on the Neural Engine via [WhisperKit](https://github.com/argmaxinc/WhisperKit)
   (large-v3 turbo is available when speed matters more)
 - **Speaker labels** (Speaker A, B, C…) via pyannote, which adds about 5 seconds per meeting
-- **Summaries** from a local [Ollama](https://ollama.com) model (`qwen3.5:9b`), with a "Job interview" mode
-  (strengths, concerns, logistics)
+- **Debriefs** from a local [Ollama](https://ollama.com) model (`qwen3.5:9b`), written so you can remember the
+  meeting weeks later and act on it: decisions, action items and open questions for meetings; for interviews, how
+  the candidate handled each technical follow-up (Clear, Vague or Couldn't explain) and a Strong/Mixed/Weak signal
+- **Hallucination checks** in code: numbers the transcript doesn't contain, invented names and empty sections are
+  removed, and an interview's signal is computed from the verdicts so it can't contradict them
 - Built for **mixed-language** meetings: we use it for interviews that switch between Arabic and English
 - A full-screen terminal app that is keyboard driven, with live progress and a clean exit
 
@@ -55,7 +58,7 @@ debrief
 
 | Key | |
 |---|---|
-| `enter` | transcribe and summarize the selected meeting |
+| `enter` | transcribe and summarize the selected meeting (pick the meeting type while it runs) |
 | `tab` | switch between summary and transcript |
 | `c` | copy the summary, formatted for Slack |
 | `r` | redo just the summary (about a minute, no re-transcription) |
@@ -64,12 +67,16 @@ debrief
 | `esc` | cancel a run |
 | `q` | quit |
 
+Pressing `enter` starts transcription straight away and opens a small window where you pick the meeting type
+(general meeting, job interview, 1:1, client call) and can add a hint such as "senior backend role". You can
+ignore it; it closes on its own when the summary starts and uses your last choice.
+
 Each meeting folder gets `transcript.md`, `transcript.srt` and `summary.md`.
 
 For scripts, there is also a one-shot mode with no UI:
 
 ```sh
-debrief ~/Documents/Meetings/standup -w turbo -p "weekly standup"
+debrief ~/Documents/Meetings/standup -w turbo -k "General meeting" -p "weekly standup"
 ```
 
 ## Benchmarks
@@ -81,15 +88,20 @@ Measured on two real interviews on an M5 MacBook Pro with 32 GB of RAM:
 | Whisper large-v3 | 8:37 (5.6× realtime) | 8:23 (4.6×) |
 | Whisper large-v3 turbo | 2:08 (22.6×) | 2:17 (17.1×) |
 | Speaker labels | 0:05 | 0:04 |
-| Summary (`qwen3.5:9b`) | about 0:55 | about 0:50 |
+| Summary (`qwen3.5:9b`) | about 1:00 to 1:30 | about 1:00 to 1:30 |
 
 **Why large-v3 is the default:** on Arabic speech, large-v3 writes an English translation while turbo writes
 the Arabic down word for word. Turbo is 4× faster, but any Arabic name it mishears ends up in the summary as
 fact. Summaries built from the large-v3 transcripts were noticeably more accurate. On English-only meetings,
 turbo is an easy win: switch it under `,` → `w` after running `debrief setup -w turbo`.
 
-Treat summaries as a first draft. A 9B model still occasionally keeps a misheard name, so skim names and
-numbers before you post.
+**Why one model call:** we also tried multi-step pipelines (extract claims, grade each answer, then write).
+On this hardware Qwen writes about 10 tokens a second, so they took 3 to 5 minutes, and grading answers one at a
+time made the 9B model either too lenient or too strict. One focused call plus code checks was both the fastest
+and the most accurate, judged against the actual interviews.
+
+Treat summaries as a first draft. A 9B model can still keep a misheard name, so skim names and numbers before
+you post.
 
 ## Configuration
 
@@ -103,7 +115,9 @@ numbers before you post.
 
 1. `afconvert` (built into macOS) joins the chunks into one 16 kHz mono file.
 2. `whisperkit-cli` transcribes it and separates the speakers in a single pass.
-3. Ollama writes the summary from the speaker-labelled transcript.
+3. Ollama writes the debrief from the speaker-labelled transcript in one call.
+4. Code checks the debrief: numbers must appear in the transcript, names must roughly match something said,
+   empty sections go, and an interview's signal is derived from its verdicts.
 
 The whole app is one Python file, `debrief.py`.
 

@@ -9,7 +9,7 @@ A folder is ONE meeting split into chunks, joined in natural sort order. Simulta
 (e.g. applicationAudio-000.caf + microphone-000.caf) are overlaid into one timeline.
 Writes transcript.md, transcript.srt and summary.md next to the audio.
 """
-import argparse, json, os, pty, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request, wave
+import argparse, difflib, json, os, pty, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request, wave
 from array import array
 from collections import deque
 from datetime import date, datetime
@@ -34,37 +34,140 @@ PREFERRED_MODELS = ["qwen3.5:9b", "qwen3-vl:8b-instruct", "qwen3-vl:8b"]
 AUDIO_EXT = {".caf", ".wav", ".m4a", ".mp3", ".mp4", ".aac", ".aiff", ".aif", ".flac"}
 LANGS = {"auto": "Auto-detect", "en": "English", "ar": "Arabic"}
 SPEAKER_CHOICES = {"auto": "Auto-detect", "2": "2 people", "3": "3 people", "4": "4 people", "5": "5 people", "off": "Off"}
+# One Qwen call writes the debrief; check_summary() then removes what the transcript cannot back up.
+# Tuned on real interviews: a single focused call was both faster and more accurate than multi-step pipelines.
+# The wording is load-bearing for a 9B model (one added sentence flipped a candidate from Weak to Strong), so
+# re-check real transcripts after any change to these prompts.
+SUMMARY_SYSTEM = (
+    "You write debriefs of meetings from speech-recognition transcripts that mix Arabic and English. Some phrases are "
+    "misheard: if a phrase does not make sense, ignore it; never repeat it, guess what it meant, or hold it against the "
+    "speaker, since the garbling comes from the speech recognition. Write in plain English in your own words, without "
+    "quoting the transcript. Use only what was said.")
+INTERVIEW_TASK = """Write a debrief of this job interview so the team can remember the candidate and compare candidates
+later. Stay neutral and judge by how the candidate answered the follow-up questions, not by what they claimed or what
+their CV says. The interviewers' description of their own company is not about the candidate.
+## Overview
+3-4 sentences: who the candidate is, what they presented, how the interview went.
+## Depth check
+One bullet per technical question the interviewers probed (how something works, why, or how a problem was solved;
+not background or team questions): what was asked and the gist of the answer, ending with
+**Clear** (specific detail on how or why), **Vague** (generic, or interviewers had to keep re-asking) or
+**Couldn't explain** (no real answer, or credited someone else).
+## Strengths
+Only what was answered clearly. If nothing was, write "None demonstrated."
+## Concerns
+## Logistics
+Only availability, salary expectation or notice period the candidate stated. Leave this section out if none."""
+MEETING_TASK = """Write a debrief of this meeting so someone can remember it weeks later and act on it.
+## Overview
+3-4 sentences: who met, what about, and what came out of it.
+## Key points
+4-7 bullets with the concrete details that matter.
+## Decisions
+## Action items
+Each with its owner.
+## Open questions
+Leave out any section with nothing to put in it."""
 CONTEXTS = {
     "General meeting": "",
-    "Job interview": "This is a job interview; the summary will be posted under the candidate in Slack. Replace "
-                     "'Key points' with '## Strengths' and '## Concerns' (3-5 bullets each, each backed by something "
-                     "said). Include stated logistics (availability, "
-                     "salary expectation, start date) as one bullet under Next steps.",
-    "1:1": "This is a one-on-one. Highlight feedback given, concerns raised and agreed follow-ups.",
-    "Client call": "This is a client call. Highlight the client's needs, objections, commitments and follow-ups.",
+    "Job interview": "",
+    "1:1": "This is a one-on-one: capture feedback given, concerns raised and agreed follow-ups.",
+    "Client call": "This is a client call: capture the client's needs, objections, commitments and follow-ups.",
 }
-SUMMARY_SYSTEM = """You summarize meeting transcripts produced by local speech recognition.
-Meetings may mix languages (e.g. Arabic and English): expect misheard names and terms, and speaker labels
-(Speaker A, B, ...) that are occasionally wrong. Use only what the transcript says; never invent.
-Do not state outcomes, decisions or judgements (e.g. "passed", "self-taught", "below market") that
-nobody in the meeting actually said. Refer to people by name or role, not by gendered pronouns.
-The summary gets pasted into Slack: 300-450 words, scannable, specific, no filler.
-Write in English, in Markdown, with exactly these sections:
-## Overview
-(2-3 sentences: who met, about what, the gist)
-## Key points
-(5-8 bullets, each one or two lines with the concrete detail that was said)
-## Next steps
-(1-3 bullets of what was agreed; omit the section if nothing was)
-Names: use a person, company or product name only if it is clearly said and makes sense in context.
-Never build a name out of garbled words; write "a previous employer", "the interviewer" etc. instead.
-If a person, place or organization name looks misheard (odd spelling, not a real name), drop it:
-"a university student", not a guessed university. Silently fix obvious misspellings of well-known
-technologies (write Proxmox, not "Broxmox"), without mentioning the fix. Never compare numbers like
-salary to the market; just report them.
-If a passage is garbled, leave it out. Do not speculate about what it meant.
-Passages marked [unclear audio] could not be transcribed: skip them.
-No preamble, no closing remarks, no participant list."""
+
+
+def summary_context(kind, hint=""):
+    """The task text for one summary: the meeting type's instructions plus the user's optional hint."""
+    base = INTERVIEW_TASK if kind == "Job interview" else MEETING_TASK
+    return "\n".join(filter(None, [base, CONTEXTS.get(kind, ""), f"Extra context from the user: {hint}" if hint else ""]))
+
+
+# ── summary checks ───────────────────────────────────────────────────────────
+
+VERDICT_RE = re.compile(r"\*\*(Clear|Vague|Couldn't explain)\*\*")
+NOT_DISCUSSED = re.compile(r"\b(not (discussed|mentioned|stated|specified|provided)|none (stated|mentioned)|n/a)\b", re.I)
+ALWAYS_OK = {"sar", "usd", "ai", "api", "apis", "ui", "ux", "cv", "llm", "llms", "sql", "ceo", "cto", "hr", "ios",
+             "android", "english", "arabic", "speaker", "clear", "vague", "none", "overview"}
+
+
+def _english_words():
+    try:
+        return {w.strip().lower() for w in open("/usr/share/dict/words")}
+    except OSError:
+        return set()
+
+
+ENGLISH = _english_words()
+
+
+class Source:
+    """What a transcript contains: exact numbers, and words (plus joined pairs) to match names loosely against,
+    since speech recognition spells names freely ("Neon DB" for NeonDB)."""
+
+    def __init__(self, transcript):
+        low = transcript.lower()
+        self.numbers = set(re.findall(r"\d+", low.replace(",", "")))
+        w = re.findall(r"[a-z؀-ۿ0-9]+", low)
+        self.vocab = set(w) | {a + b for a, b in zip(w, w[1:])}
+        self.by_first = {}
+        for v in self.vocab:
+            self.by_first.setdefault(v[:1], []).append(v)
+
+    def has_name(self, tok):
+        for part in tok.split("-"):
+            t = re.sub(r"[^a-z0-9]", "", part.lower())
+            if not t or t in ALWAYS_OK or t in ENGLISH or t in self.vocab or t.rstrip("s") in self.vocab:
+                continue
+            if not difflib.get_close_matches(t, self.by_first.get(t[:1], []), 1, 0.75):
+                return False
+        return True
+
+    def supports(self, line, names=True):
+        """Standalone numbers must appear exactly; capitalised names only roughly."""
+        body = re.sub(r"^\s*[-*•]\s*", "", VERDICT_RE.sub("", line))
+        if any(n.replace(",", "").rstrip(".") not in self.numbers
+               for n in re.findall(r"(?<![\w.])\d[\d,.]*(?![\w])", body)):
+            return False
+        return not names or all(self.has_name(t) for t in re.findall(r"\b[A-Z][a-zA-Z'-]{2,}", body.split(" ", 1)[-1]))
+
+
+def check_summary(draft, transcript):
+    """Drop what the transcript cannot back up and sections with nothing in them; for an interview, derive the
+    Signal from the depth-check verdicts so it can never contradict them. Returns (markdown, dropped lines)."""
+    src, interview = Source(transcript), "## Depth check" in draft
+    out, dropped, verdicts = [], [], []
+    for m in re.finditer(r"^##\s*([^\n]+)\n(.*?)(?=^##\s|\Z)", draft, re.M | re.S):
+        title, body = m[1].strip(), m[2].strip()
+        depth = title.lower().startswith("depth")
+        if interview and title.lower().startswith("next step"):
+            continue  # every candidate hears the hiring process, rejected ones included
+        if NOT_DISCUSSED.search(body) and len(body.split()) < 25:
+            continue
+        lines = []
+        for line in filter(str.strip, body.splitlines()):
+            if line.lstrip().startswith(("-", "*", "•")):
+                ok = src.supports(line, names=not depth)  # a dropped depth bullet would skew the Signal
+                (lines.append(line) if ok else dropped.append(line))
+            else:
+                sents = re.split(r"(?<=[a-z0-9)][.!?])\s+(?=[A-Z])", line)
+                kept = [s for s in sents if src.supports(s)]
+                dropped += [s for s in sents if s not in kept]
+                if kept:
+                    lines.append(" ".join(kept))
+        if depth:
+            verdicts = VERDICT_RE.findall("\n".join(lines))
+        if lines:
+            out.append((title, "\n".join(lines)))
+    if interview and verdicts:
+        clear = verdicts.count("Clear")
+        if not clear:  # strengths can only come from answers that held up
+            out = [(t, b) for t, b in out if t.lower() != "strengths"]
+            at = next((i + 1 for i, (t, _) in enumerate(out) if t.lower().startswith("depth")), len(out))
+            out.insert(at, ("Strengths", "None demonstrated."))
+        signal = "Strong" if clear > len(verdicts) / 2 else "Weak" if clear < len(verdicts) / 2 else "Mixed"
+        out.insert(1 if out and out[0][0].lower() == "overview" else 0,
+                   ("Signal", f"**{signal}**: {clear} of {len(verdicts)} probed topics answered clearly."))
+    return "\n\n".join(f"## {t}\n{b}" for t, b in out), dropped
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
@@ -436,14 +539,14 @@ class Job:
         return turns
 
     def _summarize(self, transcript):
-        model, context = self.opts["model"], self.opts["context"]
+        model, task = self.opts["model"], self.opts["context"] or summary_context("General meeting")
         est = len(transcript) // 3
-        ctx = min(131072, max(8192, (est + 6000) // 1024 * 1024))
-        user = (f"Context: {context}\n\n" if context else "") + "Transcript:\n\n" + transcript
-        body = json.dumps({"model": model, "stream": True, "think": False, "options": {"num_ctx": ctx, "temperature": 0.3,
-                           # ponytail: hard cap; small models loop on long transcripts without it
-                           "num_predict": 1100, "repeat_penalty": 1.15},
-                           "messages": [{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": user}]})
+        ctx = min(131072, max(8192, (est + 2500) // 1024 * 1024))
+        body = json.dumps({"model": model, "stream": True, "think": False,
+                           # ponytail: hard cap; small models can loop on long transcripts without it
+                           "options": {"num_ctx": ctx, "temperature": 0, "num_predict": 1000},
+                           "messages": [{"role": "system", "content": SUMMARY_SYSTEM},
+                                        {"role": "user", "content": f"Transcript:\n{transcript}\n\nTask: {task}"}]})
         req = urllib.request.Request(f"{OLLAMA}/api/chat", body.encode(), {"Content-Type": "application/json"})
         self.start("Summary", f"{model}: loading and reading ~{est:,} tokens of transcript…")
         n, first, stats = 0, None, {}
@@ -464,10 +567,14 @@ class Job:
                         stats = msg
         except OSError as e:
             raise Fail(f"Ollama request failed: {e}")
-        self.summary = re.sub(r"<think>.*?</think>", "", self.summary, flags=re.S).strip()
+        draft = re.sub(r"<think>.*?</think>", "", self.summary, flags=re.S).strip()
+        self.summary, dropped = check_summary(draft, transcript)
+        if dropped:
+            self.log.append(f"removed {len(dropped)} line(s) the transcript does not support")
         (self.outdir / f"{self.prefix}summary.md").write_text(
             f"# Summary: {self.target.stem}\n\n{self.summary}\n\n---\n_Generated locally by {model} "
-            f"from {self.prefix}transcript.md._\n")
+            f"from {self.prefix}transcript.md"
+            + (f"; {len(dropped)} unsupported statement(s) removed" if dropped else "") + "._\n")
         self.finish("Summary", f"{model} · {stats.get('prompt_eval_count', '?')} tokens in, "
                                f"{stats.get('eval_count', n)} out")
 
@@ -551,6 +658,37 @@ def tui():
             node = self.query_one("#picker", DirectoryTree).cursor_node
             if node and node.data:
                 self.dismiss(Path(node.data.path))
+
+    class MeetingType(ModalScreen):
+        """Meeting type and an optional hint for the summary. Shown while transcription already runs."""
+        CSS = """
+        MeetingType { align: center middle; }
+        #kind-panel { width: 76; height: auto; border: round $accent; border-title-color: $accent;
+                      background: $surface; padding: 1 2; }
+        #kinds { height: auto; margin: 1 0; }
+        """
+        BINDINGS = [Binding("enter", "confirm", "Use this", priority=True), Binding("escape", "dismiss", "Skip")]
+
+        def __init__(self, current, note):
+            super().__init__()
+            self.current, self.note = current, note
+
+        def compose(self):
+            with Vertical(id="kind-panel"):
+                yield Static(Text(self.note, style="dim"))
+                yield OptionList(*[Option(k, id=k) for k in CONTEXTS], id="kinds")
+                yield Input(placeholder="Optional hint, e.g. senior backend role, probe system design", id="hint")
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#kind-panel").border_title = "What kind of meeting?  ↑↓ type · tab hint · enter use"
+            kinds = self.query_one("#kinds", OptionList)
+            kinds.highlighted = list(CONTEXTS).index(self.current) if self.current in CONTEXTS else 0
+            kinds.focus()
+
+        def action_confirm(self):
+            kind = list(CONTEXTS)[self.query_one("#kinds", OptionList).highlighted or 0]
+            self.dismiss((kind, self.query_one("#hint", Input).value.strip()))
 
     class Settings(ModalScreen):
         CSS = """
@@ -816,6 +954,10 @@ def tui():
             right.scroll_home(animate=False)
 
         def tick(self):
+            if isinstance(self.screen, MeetingType) and self.running() and \
+                    self.job.steps["Summary"]["state"] != "wait" and not self.job.opts.get("summary_only"):
+                self.screen.dismiss(None)
+                self.notify(f"Summary started as: {self.state['kind']}. Press r afterwards to redo it as something else.")
             if not self.running() or self.selected != self.job.target:
                 return
             self.query_one("#info", Static).update(render_job(self.job, self.stats if self.job.running else None))
@@ -830,6 +972,8 @@ def tui():
 
         # ── events / actions ──
         def check_action(self, action, parameters):
+            if self.screen.is_modal and action != "quit":
+                return False  # let the open popup have enter, tab, letters
             if action == "back":
                 return self.running() or self.query_one("#search").display
             if action == "run" and self.running():
@@ -837,7 +981,7 @@ def tui():
             return True
 
         def on_option_list_option_highlighted(self, event):
-            if event.option.id:
+            if event.option_list.id == "meetings" and event.option.id:  # popups' lists bubble up here too
                 self.select(Path(event.option.id))
 
         def on_input_changed(self, event):
@@ -881,7 +1025,20 @@ def tui():
             if (outdir / f"{prefix}transcript.md").exists() and self.rerun_armed != path:
                 self.rerun_armed = path
                 return self.notify("Already transcribed. Press enter again to redo it.")
-            self.start_job(path)
+            job = self.start_job(path)
+            if not job.opts["model"]:
+                return
+
+            def chosen(result):
+                if not result:
+                    return
+                if job.steps["Summary"]["state"] == "wait":
+                    job.opts["context"] = summary_context(*result)
+                    self.notify(f"The summary will be written as: {result[0]}" + (" + your hint" if result[1] else ""))
+                else:
+                    self.notify("The summary had already started. Press r to redo it with this type.")
+            self.ask_kind("Transcription has started in the background. Pick the meeting type for the "
+                          "summary and add a hint if you like.", chosen)
 
         def action_resummarize(self):
             if self.running() or not self.selected:
@@ -891,18 +1048,31 @@ def tui():
                 return self.notify("Transcribe it first (enter).", severity="warning")
             if not self.model():
                 return self.notify("No summary model. Press , then m, or open the Ollama app.", severity="warning")
-            self.start_job(self.selected, summary_only=True)
+            path = self.selected
+            self.ask_kind("Redo the summary of this meeting as:",
+                          lambda r: r and self.start_job(path, summary_only=True, context=summary_context(*r)))
 
-        def start_job(self, path, summary_only=False):
+        def ask_kind(self, note, then):
+            """The pick becomes the saved default for next time, then `then` gets (kind, hint) or None."""
+            def chosen(result):
+                if result:
+                    self.state["kind"] = result[0]
+                    save_state(self.state)
+                then(result)
+            self.push_screen(MeetingType(self.state["kind"], note), chosen)
+
+        def start_job(self, path, summary_only=False, context=None):
             s, model = self.state, self.model()
             opts = {"whisper": s["whisper"], "lang": s["lang"],
                     "speakers": s["speakers"] if SPEAKERS.exists() else "off", "model": model,
-                    "context": CONTEXTS.get(s["kind"], "") if model else "", "summary_only": summary_only}
+                    "context": (context if context is not None else summary_context(s["kind"])) if model else "",
+                    "summary_only": summary_only}
             self.job, self.shown_summary = Job(path, audio_files(path), opts), None
             self.query_one("#doc", Markdown).update("")
             self.reload(keep=path)
             self.refresh_bindings()
             self.execute(self.job)
+            return self.job
 
         @work(thread=True)
         def execute(self, job):
@@ -965,6 +1135,20 @@ def selftest():
     fs = [Path(n) for n in ("applicationAudio-000.caf", "applicationAudio-001.caf", "microphone-000.caf")]
     assert {k: len(v) for k, v in tracks(fs).items()} == {"applicationAudio": 2, "microphone": 1}
     assert overlaid([100, 95]) and not overlaid([100, 40]) and not overlaid([100])
+    tr = "Speaker A: we pay 4500 per month to the Naqshat team"
+    draft = ("## Overview\nThey met. Salary is 9000 riyals.\n\n## Depth check\n- **A**: x **Vague**\n"
+             "- **B**: y **Couldn't explain**\n- **C**: z 4500 **Clear**\n\n## Strengths\nGreat at Naqshatt.\n\n"
+             "## Next steps\nSecond round.\n\n## Logistics\nNot discussed.")
+    out, dropped = check_summary(draft, tr)
+    assert out == ("## Overview\nThey met.\n\n## Signal\n**Weak**: 1 of 3 probed topics answered clearly.\n\n"
+                   "## Depth check\n- **A**: x **Vague**\n- **B**: y **Couldn't explain**\n- **C**: z 4500 **Clear**\n\n"
+                   "## Strengths\nGreat at Naqshatt."), out
+    assert dropped == ["Salary is 9000 riyals."], dropped
+    out, _ = check_summary("## Overview\nMet. They hired Zorblax.\n\n## Next steps\nShip it.\n\n## Decisions\nNone mentioned.",
+                           "met ship")
+    assert out == "## Overview\nMet.\n\n## Next steps\nShip it.", out
+    out, _ = check_summary("## Depth check\n- **A**: x **Vague**\n\n## Strengths\nBuilt Pulsar.", "a")
+    assert out.endswith("## Strengths\nNone demonstrated."), out
     pcm = lambda *s: array("h", s).tobytes()
     assert mix(pcm(1000, -32000), pcm(500, -1000, 7)) == pcm(1500, -32768, 7)
     md = "# Summary: X\n\n## Overview\nHi **there**.\n\n## Key points\n- **Infra:** good\n  - nested\n\n---\n_Generated locally_"
@@ -1060,7 +1244,8 @@ def main():
     ap.add_argument("-l", "--lang", default="auto", choices=list(LANGS), help="spoken language (default: auto)")
     ap.add_argument("-s", "--speakers", default="auto", help="number of speakers, auto (default) or off")
     ap.add_argument("-m", "--model", help=f"Ollama model for the summary (default: {PREFERRED_MODELS[0]})")
-    ap.add_argument("-p", "--prompt", default="", help='context for the summary, e.g. "job interview, assess the candidate"')
+    ap.add_argument("-k", "--kind", default="General meeting", choices=list(CONTEXTS), help="meeting type")
+    ap.add_argument("-p", "--prompt", default="", help='extra context for the summary, e.g. "senior backend role"')
     ap.add_argument("--no-summary", action="store_true", help="transcript only")
     ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -1088,7 +1273,7 @@ def main():
             raise Fail(f"Ollama has no model '{args.model}'. Installed: {', '.join(models)}")
         model = args.model or default_model(models)
     job = Job(target, files, {"whisper": args.whisper, "lang": args.lang, "speakers": args.speakers if SPEAKERS.exists() else "off",
-                              "model": model, "context": args.prompt}, echo=True)
+                              "model": model, "context": summary_context(args.kind, args.prompt)}, echo=True)
     job.run()
     if job.error:
         raise Fail(job.error)
