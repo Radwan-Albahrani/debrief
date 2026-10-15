@@ -71,9 +71,11 @@ Put each meeting in its own folder inside `~/Documents/Meetings`, then run `debr
 
 Pressing `enter` starts transcription straight away and opens a small window where you can:
 - pick the meeting type: general meeting, job interview, 1:1 or client call;
-- add a hint such as "senior backend role".
+- add notes for the summary: the role, your own ratings, what to focus on. Paste a whole paragraph if you like.
 
-You can ignore it: it closes by itself when the summary starts and uses your last choice.
+Confirm with `enter` on the type, or `ctrl+s` from the notes. If you ignore the window it closes by itself when the
+summary is ready and uses your last choice. Once you start typing, the summary waits for you instead, so your notes
+are never lost; transcription keeps running either way.
 
 Next to the audio you get `transcript.md`, `transcript.srt` and `summary.md`. A single audio file `call.m4a` gets
 `call.transcript.md` and so on.

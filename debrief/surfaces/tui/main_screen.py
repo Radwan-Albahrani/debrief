@@ -224,11 +224,14 @@ class MainScreen(Screen):
         job = self.app.job
         return bool(job and job.running and (path is None or job.target == path))
 
-    def start_job(self, path: Path, summary_only: bool = False, kind: str | None = None, hint: str = "") -> Job:
+    def start_job(self, path: Path, summary_only: bool = False, kind: str | None = None, hint: str = "",
+                  hold_summary: bool = False) -> Job:
         options = Options(whisper=self.state["whisper"], lang=self.state["lang"], speakers=self.state["speakers"],
                           model=self.app.summary_model(), kind=kind or self.state["kind"], hint=hint,
                           summary_only=summary_only)
         self.app.job = job = Job(path, options)
+        if hold_summary:
+            job.hold_summary()  # until the meeting-type popup is answered or closes itself
         self.streamed_summary = None
         self.query_one("#doc", Markdown).update("")
         self.show_list(keep=path)
@@ -256,14 +259,14 @@ class MainScreen(Screen):
             self.app.bell()
         self.show_list()
 
-    def ask_kind(self, note: str, then, expired=lambda: False):
-        """Ask for the meeting type; the answer also becomes the default for next time."""
+    def ask_kind(self, note: str, then, close_when=lambda: False):
+        """Ask for the meeting type and notes; the type also becomes the default for next time."""
         def chosen(result):
             if result:
                 self.state["kind"] = result[0]
                 settings.save(self.state)
             then(result)
-        self.app.push_screen(MeetingTypePicker(self.state["kind"], note, expired), chosen)
+        self.app.push_screen(MeetingTypePicker(self.state["kind"], note, close_when), chosen)
 
     # ── actions ──────────────────────────────────────────────────────────────
 
@@ -287,19 +290,24 @@ class MainScreen(Screen):
         if library.output_file(path, library.TRANSCRIPT).exists() and self.rerun_armed != path:
             self.rerun_armed = path
             return self.notify("Already transcribed. Press enter again to redo it.")
-        job = self.start_job(path)
-        if not job.options.model:
+        has_summary = bool(self.app.summary_model())
+        job = self.start_job(path, hold_summary=has_summary)
+        if not has_summary:
             return
 
         def chosen(result):
-            if not result:
-                return
-            if not job.set_kind(*result):
-                return self.notify("The summary had already started. Press r to redo it with this type.")
-            self.notify(f"The summary will be written as: {result[0]}" + (" + your hint" if result[1] else ""),
-                        markup=False)
-        self.ask_kind("Transcription has started in the background. Pick the meeting type for the summary and "
-                      "add a hint if you like.", chosen, expired=lambda: job.kind_locked)
+            try:
+                if not result:
+                    return
+                if not job.set_kind(*result):
+                    return self.notify("The run had already ended. Press r to redo the summary with these notes.")
+                self.notify(f"The summary will be written as: {result[0]}" + (" + your notes" if result[1] else ""),
+                            markup=False)
+            finally:
+                job.release_summary()
+        self.ask_kind("Transcription has started in the background. Pick the meeting type and add notes if you "
+                      "like (a paragraph is fine); the summary waits for you once you start typing.", chosen,
+                      close_when=lambda: job.waiting_for_kind or not job.running)
 
     def action_resummarize(self):
         if self.busy() or not self.selected:

@@ -10,7 +10,8 @@ from functools import cache
 
 VERDICT_RE = re.compile(r"\*\*(Clear|Vague|Couldn't explain)\*\*")
 NOT_DISCUSSED = re.compile(r"\b(not (discussed|mentioned|stated|specified|provided|recorded)"
-                           r"|none (stated|mentioned|recorded|made|identified|noted|raised)|n/a)\b", re.I)
+                           r"|none (stated|mentioned|recorded|made|identified|noted|raised)|n/a)\b"
+                           r"|^\W*no\b[^.]*\b(were|was) (mentioned|stated|discussed|provided|given|shared)\b", re.I)
 SECTION_RE = re.compile(r"^##\s*([^\n]+)\n(.*?)(?=^##\s|\Z)", re.M | re.S)
 ALWAYS_OK = {"sar", "usd", "ai", "api", "apis", "ui", "ux", "cv", "llm", "llms", "sql", "ceo", "cto", "hr", "ios",
              "android", "english", "arabic", "speaker", "clear", "vague", "none", "overview"}

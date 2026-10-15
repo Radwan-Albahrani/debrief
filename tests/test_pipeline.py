@@ -3,6 +3,8 @@ import argparse
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from array import array
 from pathlib import Path
@@ -97,6 +99,36 @@ class JobTest(unittest.TestCase):
         self.assertIn("## Depth check", job.options.task)
         job.ended = 1.0  # the run is over
         self.assertFalse(job.set_kind("1:1"))
+
+    @mock.patch("debrief.features.summary.SummaryStream", FakeStream)
+    def test_held_summary_waits_and_uses_the_notes(self):
+        library.write_transcript(self.target, "**Speaker A** `0:00`\nhello there", "meta")
+        job = Job(self.target, Options(model="qwen", summary_only=True))
+        job.hold_summary()
+        worker = threading.Thread(target=job.run)
+        worker.start()
+        for _ in range(50):  # wait until the job reaches the summary and parks there
+            if job.waiting_for_kind:
+                break
+            time.sleep(0.02)
+        self.assertTrue(job.waiting_for_kind)
+        notes = "1. Depth: 2/5, could not handle follow-ups.\n2. Communication: 3/5."
+        self.assertTrue(job.set_kind("Job interview", notes))
+        job.release_summary()
+        worker.join(timeout=5)
+        self.assertIsNone(job.error)
+        self.assertTrue(job.options.task.endswith(f"Extra context from the user: {notes}"))  # multi-line intact
+
+    def test_cancel_while_waiting_for_notes(self):
+        library.write_transcript(self.target, "**Speaker A** `0:00`\nhello", "meta")
+        job = Job(self.target, Options(model="qwen", summary_only=True))
+        job.hold_summary()
+        worker = threading.Thread(target=job.run)
+        worker.start()
+        time.sleep(0.3)
+        job.cancel()
+        worker.join(timeout=5)
+        self.assertTrue(job.cancelled)
 
     def test_skipped_steps(self):
         job = Job(self.target, Options(model=None, speakers="off"))

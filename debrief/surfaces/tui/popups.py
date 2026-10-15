@@ -9,7 +9,7 @@ from textual import work
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DirectoryTree, Footer, Input, OptionList, Static
+from textual.widgets import DirectoryTree, Footer, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from debrief.core.config import (LANGUAGES, MEETING_KINDS, MODELS_DIR, SPEAKER_CHOICES, SPEAKER_MODEL_DIR,
@@ -49,44 +49,59 @@ class FolderPicker(ModalScreen[Path]):
 
 
 class MeetingTypePicker(ModalScreen[tuple[str, str]]):
-    """The meeting type and an optional hint for the summary.
+    """The meeting type and optional notes for the summary: a paragraph is fine (ratings, impressions, the role).
 
-    It can open while transcription already runs; `expired` says when the answer can no longer be used (the
-    summary has started), and the popup then closes itself."""
+    It can open while transcription already runs. Left untouched, it closes itself once `close_when()` is true (the
+    summary is ready to start). Once you pick a type or start typing it stays open until you confirm or skip, and
+    the caller holds the summary back meanwhile, so nothing you typed is lost."""
 
     CSS = f"""
     MeetingTypePicker {{ {POPUP_CSS} }}
-    #kind-panel {{ width: 76; height: auto; padding: 1 2; {PANEL_CSS} }}
+    #kind-panel {{ width: 84; height: auto; padding: 1 2; {PANEL_CSS} }}
     #kinds {{ height: auto; margin: 1 0; }}
+    #notes {{ height: 9; }}
     """
-    BINDINGS = [Binding("enter", "confirm", "Use this", priority=True), Binding("escape", "dismiss", "Skip")]
+    BINDINGS = [Binding("ctrl+s", "confirm", "Use this", priority=True), Binding("escape", "dismiss", "Skip")]
 
-    def __init__(self, current: str, note: str, expired: Callable[[], bool] = lambda: False):
+    def __init__(self, current: str, note: str, close_when: Callable[[], bool] = lambda: False):
         super().__init__()
-        self.current, self.note, self.expired = current, note, expired
+        self.current, self.note, self.close_when = current, note, close_when
+        self.first_choice = MEETING_KINDS.index(current) if current in MEETING_KINDS else 0
+        self.touched = False
 
     def compose(self):
         with Vertical(id="kind-panel"):
             yield Static(Text(self.note, style="dim"))
             yield OptionList(*[Option(k, id=k) for k in MEETING_KINDS], id="kinds")
-            yield Input(placeholder="Optional hint, e.g. senior backend role, probe system design", id="hint")
+            yield TextArea(id="notes", tab_behavior="focus",
+                           placeholder="Optional notes for the summary: the role, your ratings, what to focus on…")
         yield Footer()
 
     def on_mount(self):
-        self.query_one("#kind-panel").border_title = "What kind of meeting?  ↑↓ type · tab hint · enter use"
+        self.query_one("#kind-panel").border_title = "What kind of meeting?  ↑↓ type · tab notes · ctrl+s use"
         kinds = self.query_one("#kinds", OptionList)
-        kinds.highlighted = MEETING_KINDS.index(self.current) if self.current in MEETING_KINDS else 0
+        kinds.highlighted = self.first_choice
         kinds.focus()
-        self.set_interval(0.3, self._close_if_expired)
+        self.set_interval(0.3, self._close_if_untouched)
 
-    def _close_if_expired(self):
-        if self.expired():
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted):
+        if event.option_index != self.first_choice:
+            self.touched = True
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        self.action_confirm()  # enter on a type confirms; in the notes box enter is a new line
+
+    def on_text_area_changed(self, event: TextArea.Changed):
+        self.touched = True
+
+    def _close_if_untouched(self):
+        if not self.touched and self.close_when():
             self.notify(f"Summary started as: {self.current}. Press r afterwards to redo it as something else.")
             self.dismiss(None)
 
     def action_confirm(self):
         kind = MEETING_KINDS[self.query_one("#kinds", OptionList).highlighted or 0]
-        self.dismiss((kind, self.query_one("#hint", Input).value.strip()))
+        self.dismiss((kind, self.query_one("#notes", TextArea).text.strip()))
 
 
 class SettingsPopup(ModalScreen[None]):

@@ -47,6 +47,9 @@ class Job:
         self._stream: summary.SummaryStream | None = None
         self._summary_lock = threading.Lock()  # the meeting type can change until the summary starts
         self._summary_started = False
+        self._kind_settled = threading.Event()  # cleared while someone is still deciding the meeting type
+        self._kind_settled.set()
+        self.waiting_for_kind = False  # the summary is ready to start but is waiting for that decision
 
     @property
     def running(self) -> bool:
@@ -59,6 +62,13 @@ class Job:
             self.proc.terminate()
         if self._stream:
             self._stream.close()
+
+    def hold_summary(self) -> None:
+        """Make the summary wait (the other steps still run) until `release_summary`, e.g. while notes are typed."""
+        self._kind_settled.clear()
+
+    def release_summary(self) -> None:
+        self._kind_settled.set()
 
     @property
     def kind_locked(self) -> bool:
@@ -177,6 +187,12 @@ class Job:
 
     def _summarize(self, transcript: str) -> None:
         model = self.options.model
+        if not self._kind_settled.is_set():
+            self._start("Summary", "waiting for the meeting type and your notes…")
+            self.waiting_for_kind = True
+            while not self._kind_settled.wait(0.2):
+                self._check_cancel()
+            self.waiting_for_kind = False
         with self._summary_lock:  # from here on the meeting type is fixed
             self._summary_started = True
             self._stream = stream = summary.SummaryStream(model, transcript, self.options.task)

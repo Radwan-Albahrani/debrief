@@ -143,7 +143,8 @@ class SummaryChecksTest(unittest.TestCase):
         self.assertEqual(checked, "## Overview\nMet.\n\n## Next steps\nShip it.")
 
     def test_placeholder_sections_are_dropped(self):
-        draft = "## Overview\nMet.\n\n## Decisions\nNone recorded.\n\n## Open questions\nNone raised."
+        draft = ("## Overview\nMet.\n\n## Decisions\nNone recorded.\n\n## Open questions\nNone raised.\n\n"
+                 "## Logistics\nNo availability, salary expectations or notice period were mentioned.")
         self.assertEqual(summary.check_summary(draft, "met")[0], "## Overview\nMet.")
 
     def test_no_clear_answer_means_no_strengths(self):
